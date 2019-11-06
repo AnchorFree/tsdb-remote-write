@@ -14,6 +14,10 @@ import (
 )
 
 func main() {
+	var (
+		pprofAddr string
+	)
+
 	c := app.AppConfig{}
 	cli := kingpin.New("tsdb-remote-write", "Write to Prometheus remote storage directly from Prometheus TSDB")
 	cli.Flag("tsdb-dir", "TSDB Directory").Required().ExistingDirVar(&c.TsdbDir)
@@ -23,11 +27,15 @@ func main() {
 	cli.Flag("queue-capacity", "Queue capacity").Default("1000").IntVar(&c.QueueCapacity)
 	cli.Flag("queue-max-samples-per-send", "Queue max samples per send").Default("100").IntVar(&c.QueueMaxSamplesPerSend)
 	cli.Flag("queue-max-retries", "Queue max retries").Default("3").IntVar(&c.QueueMaxRetries)
+	cli.Flag("min-time", "Minimum time limit in milliseconds to send to remote storage").Default("0").Int64Var(&c.MinTime)
+	cli.Flag("max-time", "Maximum time limit in milliseconds to send to remote storage").Default("0").Int64Var(&c.MaxTime)
 	cli.Flag("backward", "Walk trough tsdb in backward order").Default("false").BoolVar(&c.Backward)
+	cli.Flag("pprof-addr", "Listen address for pprof endpoint").Default("localhost:8081").StringVar(&pprofAddr)
 
 	kingpin.MustParse(cli.Parse(os.Args[1:]))
 
-	logger := kitlog.With(kitlog.NewLogfmtLogger(kitlog.NewSyncWriter(os.Stdout)), "cli", "tsdb-remote-write")
+	logger := kitlog.With(kitlog.NewLogfmtLogger(kitlog.NewSyncWriter(os.Stdout)),
+		"cli", "tsdb-remote-write", "ts", kitlog.DefaultTimestampUTC)
 	logger = level.NewFilter(logger, level.AllowInfo())
 	log.SetOutput(kitlog.NewStdlibAdapter(logger))
 
@@ -40,7 +48,7 @@ func main() {
 	pprofMux := http.DefaultServeMux
 	http.DefaultServeMux = http.NewServeMux()
 	httpServer := &http.Server{
-		Addr:    "localhost:8081",
+		Addr:    pprofAddr,
 		Handler: pprofMux,
 	}
 	go func() {
