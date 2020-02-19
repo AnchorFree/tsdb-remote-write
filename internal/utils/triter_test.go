@@ -1,8 +1,8 @@
 package utils_test
 
 import (
-	"testing"
 	"github.com/AnchorFree/tsdb-remote-write/internal/utils"
+	"testing"
 )
 
 func TestTimeRangeForwardIterator(t *testing.T) {

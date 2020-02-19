@@ -46,7 +46,6 @@ func (i *timeRangeForwardIterator) At() TimeRange {
 	return i.r
 }
 
-
 type timeRangeBackwardIterator struct {
 	mint, maxt, step int64
 	r                TimeRange

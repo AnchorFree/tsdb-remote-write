@@ -16,6 +16,7 @@ import (
 	"github.com/oklog/ulid"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/tsdb"
 	"github.com/prometheus/tsdb/chunkenc"
@@ -31,6 +32,8 @@ type AppConfig struct {
 	QueueMaxSamplesPerSend int
 	QueueMaxRetries        int
 	Backward               bool
+	MinTime                int64
+	MaxTime                int64
 }
 
 type app struct {
@@ -40,13 +43,13 @@ type app struct {
 	pool          *chunkenc.Pool
 	blockMetaCh   chan tsdb.BlockMeta
 	wg            sync.WaitGroup
-	sampleCh      chan model.Sample
+	sampleCh      chan prompb.TimeSeries
 	clients       []*remote.Client
 }
 
 func NewApp(c *AppConfig, l log.Logger) (*app, error) {
 	if l == nil {
-		l = log.NewNopLogger()
+		l = log.With(log.NewNopLogger(), "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
 	}
 
 	pool := chunkenc.NewPool()
@@ -65,7 +68,7 @@ func NewApp(c *AppConfig, l log.Logger) (*app, error) {
 		pool:        &pool,
 		blockMetaCh: make(chan tsdb.BlockMeta),
 		wg:          *new(sync.WaitGroup),
-		sampleCh:    make(chan model.Sample, c.QueueCapacity*c.Concurrency),
+		sampleCh:    make(chan prompb.TimeSeries, c.QueueCapacity*c.Concurrency),
 		clients:     clients,
 	}, nil
 }
@@ -114,6 +117,12 @@ func (app *app) collectBlockMeta() error {
 		if m.Version != 1 {
 			continue
 		}
+		if m.MinTime > app.config.MaxTime && app.config.MaxTime > 0 {
+			continue
+		}
+		if m.MaxTime < app.config.MinTime && app.config.MinTime > 0 {
+			continue
+		}
 
 		blocksMeta = append(blocksMeta, m)
 	}
@@ -152,7 +161,16 @@ func (app *app) blockReader() {
 			continue
 		}
 		level.Info(logger).Log("msg", "block opened, start sending")
-		trIter := utils.NewTimeRangeIter(block.Meta().MinTime, block.Meta().MaxTime, 3600000, app.config.Backward)
+
+		mint, maxt := block.Meta().MinTime, block.Meta().MaxTime
+		if mint < app.config.MinTime && app.config.MinTime > 0 {
+			mint = app.config.MinTime
+		}
+		if maxt > app.config.MaxTime && app.config.MaxTime > 0 {
+			maxt = app.config.MaxTime
+		}
+
+		trIter := utils.NewTimeRangeIter(mint, maxt, 3600000, app.config.Backward)
 		for trIter.Next() {
 			tr := trIter.At()
 			level.Info(logger).Log("msg", "start sending hour", "from", tr.Start, "to", tr.End)
@@ -163,15 +181,9 @@ func (app *app) blockReader() {
 			}
 			for seriesSet.Next() {
 				series := seriesSet.At()
-				metric := labelsToMetric(series.Labels())
-				iterator := series.Iterator()
-				for iterator.Next() {
-					ts, value := iterator.At()
-					app.sampleCh <- model.Sample{
-						Metric:    metric,
-						Timestamp: model.Time(ts),
-						Value:     model.SampleValue(value),
-					}
+				app.sampleCh <- prompb.TimeSeries{
+					Labels:  extractLabels(series),
+					Samples: extractSeries(series),
 				}
 			}
 			level.Info(logger).Log("msg", "done sending hour")
@@ -189,60 +201,52 @@ func (app *app) startWriters() {
 	}
 }
 
-func getSeriesSet(blockReader tsdb.BlockReader, mint, maxt int64) (tsdb.SeriesSet, error) {
-	querier, err := tsdb.NewBlockQuerier(blockReader, mint, maxt)
-	if err != nil {
-		return nil, err
-	}
-	seriesSet, err := querier.Select(tsdb_labels.NewMustRegexpMatcher("", ".*"))
-	if err != nil {
-		return nil, err
-	}
-	return seriesSet, nil
-}
-
 func (app *app) remoteWriter(serial int) {
 	defer app.wg.Done()
 	logger := log.With(app.logger, "component", "remote_writer", "remote_writer", serial)
 	level.Info(logger).Log("msg", "start storage writer")
-	pendingSamples := model.Samples{}
+	pendingSeries := make([]prompb.TimeSeries, 0)
 
 	for {
 		select {
 		case sample, ok := <-app.sampleCh:
 			if !ok {
 				level.Info(logger).Log("msg", "error reading from channel")
-				if len(pendingSamples) > 0 {
+				if len(pendingSeries) > 0 {
 					level.Info(logger).Log("msg", "flushing pending samples")
-					app.sendSamples(pendingSamples, serial)
+					err := app.sendSamples(pendingSeries, serial)
+					if err != nil {
+						level.Error(logger).Log("msg", "non-recoverable error", "count", len(pendingSeries), "err", err)
+					}
 				}
 				return
 			}
 
-			pendingSamples = append(pendingSamples, &sample)
-			if len(pendingSamples) >= app.config.QueueMaxSamplesPerSend {
-				app.sendSamples(pendingSamples[:app.config.QueueMaxSamplesPerSend], serial)
-				pendingSamples = pendingSamples[app.config.QueueMaxSamplesPerSend:]
+			pendingSeries = append(pendingSeries, sample)
+			if len(pendingSeries) >= app.config.QueueMaxSamplesPerSend {
+				series := pendingSeries[:app.config.QueueMaxSamplesPerSend]
+				pendingSeries = pendingSeries[app.config.QueueMaxSamplesPerSend:]
+				err := app.sendSamples(series, serial)
+				if err != nil {
+					level.Error(logger).Log("msg", "non-recoverable error", "count", len(series), "err", err)
+				}
 			}
 		}
 	}
 }
 
-func labelsToMetric(ls tsdb_labels.Labels) model.Metric {
-	metric := make(model.Metric, len(ls))
-	for _, l := range ls {
-		metric[model.LabelName(l.Name)] = model.LabelValue(l.Value)
+func (app *app) sendSamples(samples []prompb.TimeSeries, serial int) error {
+	var buf []byte
+	req, err := buildWriteRequest(samples, buf)
+	if err != nil {
+		return err
 	}
-	return metric
-}
-
-func (app *app) sendSamples(samples model.Samples, serial int) {
-	req := remote.ToWriteRequest(samples)
 	for retries := app.config.QueueMaxRetries; retries > 0; retries-- {
-		err := app.clients[serial].Store(context.TODO(), req)
+		err := app.clients[serial].Store(context.Background(), req)
 		if err == nil {
-			break
+			return err
 		}
 		level.Info(app.logger).Log("msg", "failed to send metrics to remote", "client_id", serial, "error", err)
 	}
+	return nil
 }
